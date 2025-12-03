@@ -1,8 +1,8 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-
-st.title("🌤️ 台灣各地天氣預報 (SQLite Demo)")
+st.title("AIoT Lecture13 7114056186 陳鉦元")
+st.title("🌤️ 台中市各區天氣預報 (SQLite Demo)")
 
 # 讀 SQLite
 conn = sqlite3.connect("data.db")
