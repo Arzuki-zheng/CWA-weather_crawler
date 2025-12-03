@@ -1,76 +1,92 @@
 import requests
 import sqlite3
 
-# === 1. 抓 CWA API JSON ===
 URL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-D0047-073?Authorization=CWA-1F9282FA-261E-43EB-BEF0-B06D9F66AD23&format=JSON"
 
+# === 1. 抓 API JSON ===
 res = requests.get(URL)
 data = res.json()
 
-# 檢查基本結構
-records = data["records"]
-locations_root = records["Locations"]          # 這是 list
-first_block = locations_root[0]                # 只有一個 block，裡面有很多 Location
-loc_list = first_block["Location"]             # 這才是每個地點的 list
+# records -> Locations(list) -> [0] -> Location(list)
+locations_block_list = data["records"]["Locations"]
+first_block = locations_block_list[0]
+location_list = first_block["Location"]
 
-print("地點數量:", len(loc_list))
+print("地點數量:", len(location_list))
 
-# === 2. 工具函式：取「第一個有值」的 ElementValue ===
-def get_first_nonempty_value(elem_dict):
-    """從某個 WeatherElement 裡面，找第一個有值的時間區間"""
-    if not elem_dict:
-        return None
-    times = elem_dict.get("Time", [])
-    for t in times:
-        v = t.get("ElementValue", [])
-        if isinstance(v, list):
-            if not v:
-                continue
-            value = v[0].get("Value")
-        else:
-            value = v.get("Value")
-        if value not in (None, "", " "):
-            return value
-    return None
+rows = []  # 要寫進 SQLite 的所有列
 
-rows = []
+# === 2. 解析每個地點的所有時間點 ===
+for loc in location_list:
+    loc_name = loc["LocationName"]              # 例如「中區」
+    weather_elements = loc["WeatherElement"]    # 溫度、濕度、天氣 等
 
-# === 3. 解析每個地點，整理要寫進 SQLite 的欄位 ===
-for loc in loc_list:
-    location_name = loc["LocationName"]          # 地點名稱（中文）
-    elements = loc["WeatherElement"]             # 各種氣象元素 list
+    elem_map = {e["ElementName"]: e for e in weather_elements}
 
-    # 轉成 dict，方便用 ElementName 查
-    elem_map = {e["ElementName"]: e for e in elements}
+    temp_elem = elem_map.get("溫度")
+    rh_elem   = elem_map.get("相對濕度")
+    wx_elem   = elem_map.get("天氣描述") or elem_map.get("天氣") or elem_map.get("天氣現象")
 
-    min_temp = get_first_nonempty_value(elem_map.get("MinT"))
-    max_temp = get_first_nonempty_value(elem_map.get("MaxT"))
-    description = get_first_nonempty_value(elem_map.get("WeatherDescription"))
+    if not temp_elem:
+        continue  # 沒有溫度就跳過
 
-    rows.append((location_name, min_temp, max_temp, description))
+    # 以「溫度」的 Time 當主時間軸
+    for t in temp_elem.get("Time", []):
+        datatime = t["DataTime"]
 
-print("準備寫入 SQLite，筆數:", len(rows))
+        # 溫度：ElementValue[0]["Temperature"]
+        temperature = None
+        tev = t.get("ElementValue", [])
+        if isinstance(tev, list) and tev:
+            temperature = tev[0].get("Temperature")
 
-# === 4. 寫入 SQLite data.db ===
+        # 濕度：找相同 DataTime
+        humidity = None
+        if rh_elem:
+            for ht in rh_elem.get("Time", []):
+                if ht.get("DataTime") == datatime:
+                    hev = ht.get("ElementValue", [])
+                    if isinstance(hev, list) and hev:
+                        humidity = hev[0].get("RelativeHumidity")
+                    break
+
+        # 天氣描述
+        weather_desc = None
+        if wx_elem:
+            for wt in wx_elem.get("Time", []):
+                if wt.get("DataTime") == datatime:
+                    wv = wt.get("ElementValue", [])
+                    if isinstance(wv, list) and wv:
+                        weather_desc = (
+                            wv[0].get("WeatherDescription")
+                            or wv[0].get("Weather")
+                        )
+                    break
+
+        rows.append((loc_name, datatime, temperature, humidity, weather_desc))
+
+print("解析完成，準備寫入 SQLite，總列數:", len(rows))
+
+# === 3. 砍舊表 + 重建正確 schema + 寫入 ===
 conn = sqlite3.connect("data.db")
 cur = conn.cursor()
 
+# 直接砍掉舊的 weather 表，避免舊欄位影響
+cur.execute("DROP TABLE IF EXISTS weather")
+
 cur.execute("""
-CREATE TABLE IF NOT EXISTS weather (
+CREATE TABLE weather (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     location TEXT,
-    min_temp TEXT,
-    max_temp TEXT,
-    description TEXT
+    datatime TEXT,
+    temperature TEXT,
+    humidity TEXT,
+    weather_desc TEXT
 )
 """)
 
-# 清空舊資料，避免重複
-cur.execute("DELETE FROM weather")
-
-# 批次寫入
 cur.executemany(
-    "INSERT INTO weather (location, min_temp, max_temp, description) VALUES (?, ?, ?, ?)",
+    "INSERT INTO weather (location, datatime, temperature, humidity, weather_desc) VALUES (?, ?, ?, ?, ?)",
     rows
 )
 
